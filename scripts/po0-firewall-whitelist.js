@@ -73,8 +73,16 @@ function httpRequest(method, opts) {
         }
       );
     } else if (isSurgeLike) {
+      // Loon 的 $httpClient.post/get 的 timeout 单位为毫秒 (ms)，而 Surge / Stash 为秒 (s)
+      // 若传入数值 <= 500 则自动转为毫秒以兼容 Loon
+      var reqOpts = Object.assign({}, opts);
+      if (typeof $loon !== "undefined" || (typeof $environment !== "undefined" && $environment["target-platform"] === "Loon")) {
+        if (reqOpts.timeout && reqOpts.timeout <= 500) {
+          reqOpts.timeout = reqOpts.timeout * 1000;
+        }
+      }
       var fn = method === "POST" ? $httpClient.post : $httpClient.get;
-      fn(opts, function (error, response, body) {
+      fn(reqOpts, function (error, response, body) {
         if (error) resolve({ error: String(error) });
         else resolve({ body: body, status: response && (response.status || response.statusCode) });
       });
@@ -171,16 +179,11 @@ function apiCall(token, slot) {
   if (slot !== null && slot !== undefined && slot !== "") {
     url += "?slot=" + encodeURIComponent(slot);
   }
-  // Loon 平台的 $httpClient 接受毫秒(ms)，Surge/Stash 接受秒(s)
-  // 传 15 会导致 Loon 在 15ms 内超时中断，统一传 15000（Surge/Stash 容错或 Loon 15s）
-  var isLoon = typeof $loon !== "undefined" || (typeof $environment !== "undefined" && $environment["target-platform"] === "Loon");
-  var timeoutSec = isLoon ? 15000 : 15;
-
   return httpRequest("POST", {
     url: url,
     headers: { "Content-Type": "application/json" },
     body: "",
-    timeout: timeoutSec,
+    timeout: 15,
   }).then(function (r) {
     if (r.error) return { error: r.error };
     var data = null;
