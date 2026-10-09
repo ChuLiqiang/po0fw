@@ -171,11 +171,16 @@ function apiCall(token, slot) {
   if (slot !== null && slot !== undefined && slot !== "") {
     url += "?slot=" + encodeURIComponent(slot);
   }
+  // Loon 平台的 $httpClient 接受毫秒(ms)，Surge/Stash 接受秒(s)
+  // 传 15 会导致 Loon 在 15ms 内超时中断，统一传 15000（Surge/Stash 容错或 Loon 15s）
+  var isLoon = typeof $loon !== "undefined" || (typeof $environment !== "undefined" && $environment["target-platform"] === "Loon");
+  var timeoutSec = isLoon ? 15000 : 15;
+
   return httpRequest("POST", {
     url: url,
     headers: { "Content-Type": "application/json" },
     body: "",
-    timeout: 15,
+    timeout: timeoutSec,
   }).then(function (r) {
     if (r.error) return { error: r.error };
     var data = null;
