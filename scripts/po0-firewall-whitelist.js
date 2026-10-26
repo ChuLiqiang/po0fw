@@ -3,32 +3,12 @@
  * 兼容：Surge / Stash / Shadowrocket / Loon / Quantumult X
  * （Egern 运行模型不同，用独立的 egern/po0-firewall-whitelist.js）
  *
- * POST /api/firewall/<token>/add  把"当前请求源 IP"加入白名单，并回显
- *   {enabled, whitelist:[{ip,slot}], limit, currentIp}。token 走 URL 路径，无需
- *   Authorization 头。服务端对已在白名单的 IP 做幂等处理（重复请求不
- *   重复占坑、不推进淘汰队列），因此这里每次直接无脑请求。
- * 加白粒度为 C 段（/24）：服务端把 whitelist 条目和 currentIp 都归一化成
- *   x.x.x.0/24 回显；同段内换 IP 不产生新写入。脚本用 sameC24() 做匹配，
- *   兼容精确 IP 与 /24 段混杂的新旧格式。
- * 白名单写满后按写入时间先进先出自动淘汰最旧 IP；API 无删除接口。
- *
- * 策略：
- * - 每次直接 POST 上报当前出口 IP，蜂窝与 WiFi/有线同等处理。
- * - 默认 slotless 写入：按 updated_at 触发 LRU 淘汰，被挤出的设备靠自己的
- *   cron/事件几分钟内自动补回。
- * - 可选固定槽位：token 后加 @N（如 pgnfw_xxx@0）→ POST .../add?slot=N，
- *   把本机 IP 钉在槽位 N，**永不被 LRU 淘汰**。槽位写入语义：
- *     · 本机 IP 已在该槽位 → 刷新 updated_at；
- *     · 槽位有旧 IP → 行级顶替，旧 IP 丢弃；
- *     · 本机 IP 已 slotless → 删 slotless 行升级到该槽位；
- *     · 本机 IP 已占用**别的**槽位 → 403 冲突，需先去 UI 删旧槽位（脚本会报 ❌）。
- * - 蜂窝（主接口 pdp_ip*）写入的 IP 仅做 📶 标记，便于面板识别。
- *
- * token 来源（优先级从高到低）：
- * 1. argument: tokens=<pgnfw_xxx>[@槽位],<pgnfw_yyy>（Surge/Loon/Stash 模块参数）
- * 2. 持久化存储 key "po0fw_tokens"（Quantumult X 等不支持参数的客户端，
- *    可用 BoxJs 或一次性脚本写入）
- * 3. 下面的 INLINE_TOKENS 常量（自己维护脚本副本时直接填这里）
+ * 策略（先查后加）：
+ * 1. 触发时先发只读 GET /api/firewall/<token> 探测当前出口 IP 与服务端白名单状态。
+ * 2. 比对当前出口 IP 是否已经在白名单网段（/24）中且槽位匹配：
+ *    - 若已在白名单：跳过 POST 加白请求，不推进 LRU 淘汰队列，保持静默不弹通知。
+ *    - 若不在白名单：才发起 POST /api/firewall/<token>/add[?slot=N] 写入加白，并弹通知。
+ * 3. 服务端按 C 段（/24）归一化，白名单满 5 个按最早写入 FIFO 淘汰（带 @slot 槽位永不被淘汰）。
  */
 
 var INLINE_TOKENS = "";
@@ -42,6 +22,30 @@ var HIST_WINDOW_MS = 24 * 3600 * 1000; // 📶 标记的记账窗口
 
 var isQX = typeof $task !== "undefined";
 var isSurgeLike = typeof $httpClient !== "undefined"; // Surge/Stash/Shadowrocket/Loon
+
+// 客户端细分：各家注入的标识不同，Loon 有全局 $loon，
+// Surge 系则在 $environment 里带 surge-version / shadowrocket-version 等字段。
+var envInfo = "";
+try {
+  if (typeof $environment !== "undefined" && $environment) {
+    envInfo = JSON.stringify($environment).toLowerCase();
+  }
+} catch (e) {}
+
+var isLoon = typeof $loon !== "undefined" || envInfo.indexOf("loon") >= 0;
+var isSurgeFamily =
+  envInfo.indexOf("surge-version") >= 0 ||
+  envInfo.indexOf("shadowrocket") >= 0 ||
+  envInfo.indexOf("stash") >= 0;
+
+// ⚠️ timeout 单位在不同客户端不一致：
+//   Surge / Shadowrocket / Stash → 秒
+//   Loon / Quantumult X          → 毫秒
+// 写死 15 会让 Loon 只等 15 毫秒 → 必然超时 → 回调 error=null → 通知里显示 "(null)"。
+// 无法判定时干脆不传 timeout，交给模块声明的 timeout=60 兜底，避免再踩单位坑。
+var REQUEST_TIMEOUT = null;
+if (isLoon || isQX) REQUEST_TIMEOUT = 15000;
+else if (isSurgeFamily) REQUEST_TIMEOUT = 15;
 
 function storeRead(key) {
   if (isQX) return $prefs.valueForKey(key);
@@ -60,7 +64,22 @@ function notify(title, subtitle, body) {
   else if (typeof $notification !== "undefined") $notification.post(title, subtitle, body);
 }
 
-function httpRequest(method, opts) {
+// 各客户端失败时回传的 error 五花八门：Loon 在网络瞬断 / TLS 握手失败时
+// 直接回调 error=null，裸 String(null) 只会得到毫无信息量的 "null"。
+function describeHttpError(error) {
+  var text;
+  if (error === null || error === undefined) text = "";
+  else if (typeof error === "object")
+    text = String(error.message || error.error || error.description || "");
+  else text = String(error);
+  text = text.replace(/^\s+|\s+$/g, "");
+  if (text === "" || text === "null" || text === "undefined" || text === "{}") {
+    return "网络请求失败（超时 / 握手失败 / 被拦截）";
+  }
+  return text;
+}
+
+function httpRequestOnce(method, opts) {
   return new Promise(function (resolve) {
     if (isQX) {
       opts.method = method;
@@ -69,26 +88,63 @@ function httpRequest(method, opts) {
           resolve({ body: resp.body, status: resp.statusCode });
         },
         function (err) {
-          resolve({ error: String((err && err.error) || err) });
+          resolve({ error: describeHttpError((err && err.error) || err) });
         }
       );
     } else if (isSurgeLike) {
-      // Loon 的 $httpClient.post/get 的 timeout 单位为毫秒 (ms)，而 Surge / Stash 为秒 (s)
-      // 若传入数值 <= 500 则自动转为毫秒以兼容 Loon
-      var reqOpts = Object.assign({}, opts);
-      if (typeof $loon !== "undefined" || (typeof $environment !== "undefined" && $environment["target-platform"] === "Loon")) {
-        if (reqOpts.timeout && reqOpts.timeout <= 500) {
-          reqOpts.timeout = reqOpts.timeout * 1000;
-        }
-      }
-      var fn = method === "POST" ? $httpClient.post : $httpClient.get;
-      fn(reqOpts, function (error, response, body) {
-        if (error) resolve({ error: String(error) });
+      // 注意：不能把 $httpClient.post 解引用成局部变量再调用 —— Shadowrocket 的
+      // $httpClient 是 ObjC 桥接对象，脱离对象调用会抛
+      // "self type check failed for Objective-C instance method"。必须直调。
+      var cb = function (error, response, body) {
+        if (error) resolve({ error: describeHttpError(error) });
         else resolve({ body: body, status: response && (response.status || response.statusCode) });
-      });
+      };
+      if (method === "POST") $httpClient.post(opts, cb);
+      else $httpClient.get(opts, cb);
     } else {
       resolve({ error: "unsupported client" });
     }
+  });
+}
+
+function delay(ms) {
+  return new Promise(function (resolve) {
+    if (typeof setTimeout === "function") setTimeout(resolve, ms);
+    else resolve();
+  });
+}
+
+// 移动网络下单次请求失败很常见（cron 触发时链路刚唤醒 / 切网瞬间）。
+// 服务端对重复 IP 幂等，重试 POST /add 不会重复占坑或推进淘汰队列，因此可安全重试。
+var HTTP_RETRY = 3;
+var HTTP_RETRY_DELAY_MS = 1500;
+
+// 服务端瞬时异常也值得重试：po0 API 偶发返回裸 400（body 仅 "Error"）/ 5xx，
+// 几秒后同一 token 即成功。规范 JSON 错误（如 token 无效 {"code":400,...}）不重试。
+function isRetryableServerError(r) {
+  if (!r || !r.status) return false;
+  if (r.status >= 500) return true;
+  if (r.status >= 200 && r.status < 300) return false;
+  if (r.status === 403) return false; // 槽位冲突，重试无意义
+  try {
+    JSON.parse(r.body);
+    return false; // 规范 JSON 错误 = 确定性失败，不重试
+  } catch (e) {
+    return true; // 非 JSON body（如裸 "Error"）= 服务端瞬时异常
+  }
+}
+
+function httpRequest(method, opts, attempt) {
+  attempt = attempt || 1;
+  return httpRequestOnce(method, opts).then(function (r) {
+    if (!r.error && !isRetryableServerError(r)) return r;
+    if (attempt >= HTTP_RETRY) {
+      if (r.error) r.error = r.error + "（已重试 " + HTTP_RETRY + " 次）";
+      return r;
+    }
+    return delay(HTTP_RETRY_DELAY_MS * attempt).then(function () {
+      return httpRequest(method, opts, attempt + 1);
+    });
   });
 }
 
@@ -173,50 +229,65 @@ function readHistory(key) {
   }
 }
 
+function parseApiResponse(r) {
+  if (r.error) return { error: r.error };
+  var data = null;
+  try {
+    data = JSON.parse(r.body);
+  } catch (e) {}
+  // 带槽位写入且本机 IP 已占用别的槽位 → 服务端 403 冲突，需去 UI 删旧槽位
+  if (r.status === 403) {
+    return {
+      error: "槽位冲突：本机 IP 已在其它槽位，请先去 UI 删除",
+      conflict: true,
+      currentIp: data && data.currentIp,
+    };
+  }
+  if (!data) return { error: "响应异常: " + String(r.body).slice(0, 80) };
+  // whitelist 元素为 {ip, slot} 对象（旧版曾是纯 IP 字符串）：记下 ip→slot 再摊平成 IP 数组
+  var raw = Array.isArray(data.whitelist) ? data.whitelist : [];
+  data.slotOf = {};
+  raw.forEach(function (e) {
+    if (e && typeof e === "object" && e.slot !== null && e.slot !== undefined) {
+      data.slotOf[e.ip] = e.slot;
+    }
+  });
+  data.whitelist = raw.map(function (e) {
+    return e && typeof e === "object" ? e.ip : e;
+  });
+  data.applied =
+    data.enabled === true &&
+    data.whitelist.some(function (ip) {
+      return sameC24(ip, data.currentIp);
+    });
+  return data;
+}
+
+// 纯只读探测：GET /api/firewall/<token>（不带 /add），不改动服务端任何数据
+function fetchStatus(token) {
+  var url = API_BASE + encodeURIComponent(token);
+  var opts = {
+    url: url,
+    headers: { "Content-Type": "application/json" },
+  };
+  if (REQUEST_TIMEOUT !== null) opts.timeout = REQUEST_TIMEOUT;
+  return httpRequest("GET", opts).then(parseApiResponse);
+}
+
 function apiCall(token, slot) {
   // token 走 URL 路径，命中 /add 即把当前出口 IP 加白；带 slot 则钉固定槽位
   var url = API_BASE + encodeURIComponent(token) + "/add";
   if (slot !== null && slot !== undefined && slot !== "") {
     url += "?slot=" + encodeURIComponent(slot);
   }
-  return httpRequest("POST", {
+  var opts = {
     url: url,
     headers: { "Content-Type": "application/json" },
     body: "",
-    timeout: 15,
-  }).then(function (r) {
-    if (r.error) return { error: r.error };
-    var data = null;
-    try {
-      data = JSON.parse(r.body);
-    } catch (e) {}
-    // 带槽位写入且本机 IP 已占用别的槽位 → 服务端 403 冲突，需去 UI 删旧槽位
-    if (r.status === 403) {
-      return {
-        error: "槽位冲突：本机 IP 已在其它槽位，请先去 UI 删除",
-        conflict: true,
-        currentIp: data && data.currentIp,
-      };
-    }
-    if (!data) return { error: "响应异常: " + String(r.body).slice(0, 80) };
-    // whitelist 元素为 {ip, slot} 对象（旧版曾是纯 IP 字符串）：记下 ip→slot 再摊平成 IP 数组
-    var raw = Array.isArray(data.whitelist) ? data.whitelist : [];
-    data.slotOf = {};
-    raw.forEach(function (e) {
-      if (e && typeof e === "object" && e.slot !== null && e.slot !== undefined) {
-        data.slotOf[e.ip] = e.slot;
-      }
-    });
-    data.whitelist = raw.map(function (e) {
-      return e && typeof e === "object" ? e.ip : e;
-    });
-    data.applied =
-      data.enabled === true &&
-      data.whitelist.some(function (ip) {
-        return sameC24(ip, data.currentIp);
-      });
-    return data;
-  });
+  };
+  if (REQUEST_TIMEOUT !== null) opts.timeout = REQUEST_TIMEOUT;
+
+  return httpRequest("POST", opts).then(parseApiResponse);
 }
 
 function ensureWhitelisted(item, index) {
@@ -225,18 +296,55 @@ function ensureWhitelisted(item, index) {
   var cellular = onCellular();
   var ctx = { kvState: kvState, kvHist: kvHist, slot: item.slot };
 
-  // 服务端对重复 IP 幂等，直接请求 /add 即可，无需先查
-  return apiCall(item.token, item.slot).then(function (st) {
-    if (st.applied) {
+  // 1. 先查：发只读 GET 查看当前出口 IP 是否已经在白名单
+  return fetchStatus(item.token).then(function (st) {
+    if (st.error) {
+      ctx.st = st;
+      return ctx;
+    }
+
+    var matchedIp = null;
+    if (st.applied && Array.isArray(st.whitelist)) {
+      for (var i = 0; i < st.whitelist.length; i++) {
+        if (sameC24(st.whitelist[i], st.currentIp)) {
+          matchedIp = st.whitelist[i];
+          break;
+        }
+      }
+    }
+
+    // 槽位匹配检查：如果指定了固定槽位，需确认当前 IP 在白名单中也钉在该槽位上
+    var slotMatches = true;
+    if (item.slot !== null && item.slot !== undefined && item.slot !== "") {
+      slotMatches = matchedIp && st.slotOf && String(st.slotOf[matchedIp]) === String(item.slot);
+    }
+
+    if (st.applied && slotMatches) {
+      // 当前出口 IP 已放行且槽位匹配，直接跳过 POST 写入
+      st.alreadyWhitelisted = true;
       var hist = readHistory(kvHist);
       var last = hist.length ? hist[hist.length - 1] : null;
       if (!last || last.ip !== st.currentIp) {
         hist.push({ ip: st.currentIp, src: cellular ? "cell" : "fixed", ts: Date.now() });
         storeWrite(JSON.stringify(hist.slice(-10)), kvHist);
       }
+      ctx.st = st;
+      return ctx;
     }
-    ctx.st = st;
-    return ctx;
+
+    // 2. 未放行或槽位需要更新，才调用 POST /add
+    return apiCall(item.token, item.slot).then(function (postSt) {
+      if (postSt.applied) {
+        var hist = readHistory(kvHist);
+        var last = hist.length ? hist[hist.length - 1] : null;
+        if (!last || last.ip !== postSt.currentIp) {
+          hist.push({ ip: postSt.currentIp, src: cellular ? "cell" : "fixed", ts: Date.now() });
+          storeWrite(JSON.stringify(hist.slice(-10)), kvHist);
+        }
+      }
+      ctx.st = postSt;
+      return ctx;
+    });
   });
 }
 
@@ -261,7 +369,8 @@ function describe(index, ctx) {
       return ip + slotTag + (cellIps[ip] ? " 📶" : "") + (sameC24(ip, st.currentIp) ? " ←" : "");
     })
     .join("\n    ");
-  return head + "✅ " + st.whitelist.length + "/" + st.limit + "\n    " + ips;
+  var statusSuffix = st.alreadyWhitelisted ? " (已在白名单)" : "";
+  return head + "✅ " + st.whitelist.length + "/" + st.limit + statusSuffix + "\n    " + ips;
 }
 
 // 分隔符兼容 , | ; 、；非 pgnfw_ 开头的段（如未修改的占位提示）直接忽略。
@@ -298,12 +407,17 @@ if (tokens.length === 0) {
     var exitIp = "?";
     var lines = [];
     var changed = false;
+    var hasNewWrite = false;
 
     for (var i = 0; i < results.length; i++) {
       var st = results[i].st;
       if (st.applied) okCount++;
       if (st.currentIp) exitIp = st.currentIp;
       lines.push(describe(i, results[i]));
+
+      if (st.applied && !st.alreadyWhitelisted) {
+        hasNewWrite = true;
+      }
 
       var state = (st.currentIp || "?") + "|" + (st.applied ? "1" : "0");
       if (storeRead(results[i].kvState) !== state) {
@@ -317,10 +431,14 @@ if (tokens.length === 0) {
       "po0 加白 " + okCount + "/" + results.length + " · 出口 " + exitIp + (onCellular() ? " 📶" : "");
     var content = lines.join("\n");
 
-    // 仅在出口 IP 或加白状态较上次变化时通知，例行 POST 保持安静
-    if (changed) {
+    // 仅在真实发生新增写入加白（hasNewWrite）、或存在加白失败/未生效（!allOk）时才发送系统通知；
+    // 若当前出口 IP 已在白名单中（已加白网络之间漫游），保持静默不打扰。
+    if (hasNewWrite || !allOk) {
       notify("po0 防火墙加白", title, content);
     }
     finish(title, content, allOk);
+  }).catch(function (e) {
+    notify("po0 防火墙加白", "脚本异常", String(e && e.message ? e.message : e));
+    finish("po0 加白：脚本异常", String(e && e.message ? e.message : e), false);
   });
 }

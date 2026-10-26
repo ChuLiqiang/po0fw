@@ -1,7 +1,7 @@
 #!name=po0 防火墙自动加白
-#!desc=调用 po0 防火墙 API 将本机当前出口 IP 加入白名单。支持多 token（英文逗号分割），network-changed 事件与每 10 分钟 cron 自动触发。
-#!author=reallinzc
-#!homepage=https://github.com/reallinzc/po0fw
+#!desc=调用 po0 防火墙 API 将本机当前出口 IP 加入白名单（先查后加优化版：已放行则跳过写入）。支持多 token（英文逗号分割），network-changed 事件与每 10 分钟 cron 自动触发。
+#!author=reallinzc, w0ven, ChuLiqiang
+#!homepage=https://github.com/ChuLiqiang/po0fw
 #!icon=https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/Panel.png
 
 [Argument]
